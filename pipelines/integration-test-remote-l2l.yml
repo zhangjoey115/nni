@@ -108,11 +108,3 @@ jobs:
           --nni_manager_ip $(manager_ip)
       python3 nni_test/nnitest/run_tests.py --config config/integration_tests.yml --ts remote
     displayName: Integration test (reuse mode)
-
-  - task: SSH@0
-    inputs:
-      sshEndpoint: $(worker)
-      runOptions: commands
-      commands: python3 /tmp/nnitest/$(Build.BuildId)/test/vso_tools/stop_docker.py $(Build.BuildId)
-    condition: always()
-    displayName: Stop docker
