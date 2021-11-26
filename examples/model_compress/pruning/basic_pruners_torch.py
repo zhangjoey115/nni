@@ -21,6 +21,7 @@ sys.path.append('../models')
 from mnist.lenet import LeNet
 from cifar10.vgg import VGG
 from cifar10.resnet import ResNet18
+from tsr_dense import DenseNetTSR
 
 from nni.compression.pytorch.utils.counter import count_flops_params
 
@@ -58,6 +59,8 @@ def get_dummy_input(args, device):
         dummy_input = torch.randn([args.test_batch_size, 1, 28, 28]).to(device)
     elif args.dataset in ['cifar10', 'imagenet']:
         dummy_input = torch.randn([args.test_batch_size, 3, 32, 32]).to(device)
+    elif args.model == 'dense':             # zjw
+        dummy_input = torch.randn([args.test_batch_size, 3, 128, 128]).to(device)
     return dummy_input
 
 
@@ -100,6 +103,10 @@ def get_data(dataset, data_dir, batch_size, test_batch_size):
             ])),
             batch_size=batch_size, shuffle=False, **kwargs)
         criterion = torch.nn.CrossEntropyLoss()
+    else:   # zjw
+        train_loader = None
+        test_loader = None
+        criterion = None
     return train_loader, test_loader, criterion
 
 def get_model_optimizer_scheduler(args, device, train_loader, test_loader, criterion):
@@ -126,6 +133,12 @@ def get_model_optimizer_scheduler(args, device, train_loader, test_loader, crite
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
             scheduler = MultiStepLR(
                 optimizer, milestones=[int(args.pretrain_epochs * 0.5), int(args.pretrain_epochs * 0.75)], gamma=0.1)
+    elif args.model == 'dense':             # zjw
+        model = DenseNetTSR(block_config=(4,), num_init_features=32, num_classes=46).to(device)
+        if args.pretrained_model_dir is None:
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+            scheduler = MultiStepLR(
+                optimizer, milestones=[int(args.pretrain_epochs * 0.5), int(args.pretrain_epochs * 0.75)], gamma=0.1)
     else:
         raise ValueError("model not recognized")
 
@@ -145,16 +158,18 @@ def get_model_optimizer_scheduler(args, device, train_loader, test_loader, crite
 
         torch.save(state_dict, os.path.join(args.experiment_data_dir, f'pretrain_{args.dataset}_{args.model}.pth'))
         print('Model trained saved to %s' % args.experiment_data_dir)
-
+        print('Pretrained model acc:', best_acc)
     else:
-        model.load_state_dict(torch.load(args.pretrained_model_dir))
-        best_acc = test(args, model, device, criterion, test_loader)
+        ckpt = torch.load(args.pretrained_model_dir)
+        if "model" in ckpt:
+            ckpt = ckpt["model"]
+        model.load_state_dict(ckpt)
+        # best_acc = test(args, model, device, criterion, test_loader)
 
     # setup new opotimizer for pruning
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
     scheduler = MultiStepLR(optimizer, milestones=[int(args.pretrain_epochs * 0.5), int(args.pretrain_epochs * 0.75)], gamma=0.1)
 
-    print('Pretrained model acc:', best_acc)
     return model, optimizer, scheduler
 
 def train(args, model, device, train_loader, criterion, optimizer, epoch):
@@ -268,12 +283,12 @@ def main(args):
                 'exclude': True,
                 'op_names': ['layer1.0.conv1', 'layer1.0.conv2']
             }]
-        else:
-            config_list = [{
-                'sparsity': args.sparsity,
-                'op_types': ['Conv2d'],
-                'op_names': ['feature.0', 'feature.24', 'feature.27', 'feature.30', 'feature.34', 'feature.37']
-            }]
+        # else:
+        #     config_list = [{
+        #         'sparsity': args.sparsity,
+        #         'op_types': ['Conv2d'],
+        #         'op_names': ['feature.0', 'feature.24', 'feature.27', 'feature.30', 'feature.34', 'feature.37']
+        #     }]
 
     pruner = pruner_cls(model, config_list, **kw_args)
 
@@ -297,6 +312,11 @@ def main(args):
         m_speedup = ModelSpeedup(model, dummy_input, mask_path, device)
         m_speedup.speedup_model()
 
+    # zjw: export onnx
+    save_path = os.path.join(args.experiment_data_dir, f'speeduped_no_tune.pth')
+    torch.save(model.state_dict(), save_path)
+    export_onnx(model, dummy_input, save_path[:-4]+'.onnx')
+
     print('start finetuning...')
 
     # Optimizer used in the pruner might be patched, so recommend to new an optimizer for fine-tuning stage.
@@ -304,21 +324,40 @@ def main(args):
     scheduler = MultiStepLR(optimizer, milestones=[int(args.pretrain_epochs * 0.5), int(args.pretrain_epochs * 0.75)], gamma=0.1)
 
     best_top1 = 0
-    save_path = os.path.join(args.experiment_data_dir, f'finetuned.pth')
-    for epoch in range(args.fine_tune_epochs):
-        print('# Epoch {} #'.format(epoch))
-        train(args, model, device, train_loader, criterion, optimizer, epoch)
-        scheduler.step()
-        top1 = test(args, model, device, criterion, test_loader)
-        if top1 > best_top1:
-            best_top1 = top1
-            torch.save(model.state_dict(), save_path)
+    # save_path = os.path.join(args.experiment_data_dir, f'finetuned.pth')
+    # for epoch in range(args.fine_tune_epochs):
+    #     print('# Epoch {} #'.format(epoch))
+    #     train(args, model, device, train_loader, criterion, optimizer, epoch)
+    #     scheduler.step()
+    #     top1 = test(args, model, device, criterion, test_loader)
+    #     if top1 > best_top1:
+    #         best_top1 = top1
+    #         torch.save(model.state_dict(), save_path)
 
     flops, params, results = count_flops_params(model, dummy_input)
     print(f'Finetuned model FLOPs {flops/1e6:.2f} M, #Params: {params/1e6:.2f}M, Accuracy: {best_top1: .2f}')
 
     if args.nni:
         nni.report_final_result(best_top1)
+
+
+def export_onnx(model, dummy_input, out_name):
+    conf = {'input': 'images',
+            'output': 'output',
+            'dynamic': False,
+            'opset': 11}
+
+    torch.onnx._export(
+        model,
+        dummy_input,
+        out_name,
+        input_names=[conf['input']],
+        output_names=[conf['output']],
+        dynamic_axes={conf['input']: {0: 'batch'},
+                      conf['output']: {0: 'batch'}} if conf['dynamic'] else None,
+        opset_version=conf['opset'],
+    )
+
 
 if __name__ == '__main__':
 
@@ -329,8 +368,8 @@ if __name__ == '__main__':
                         help='dataset to use, mnist, cifar10 or imagenet')
     parser.add_argument('--data-dir', type=str, default='./data/',
                         help='dataset directory')
-    parser.add_argument('--model', type=str, default='vgg16',
-                        choices=['lenet', 'vgg16', 'vgg19', 'resnet18'],
+    parser.add_argument('--model', type=str, default='dense',
+                        choices=['lenet', 'vgg16', 'vgg19', 'resnet18', 'dense'],
                         help='model to use')
     parser.add_argument('--pretrained-model-dir', type=str, default=None,
                         help='path to pretrained model')
@@ -383,4 +422,13 @@ if __name__ == '__main__':
         args.pruner = params['pruner']
         args.model = params['model']
 
+    args.model = 'dense'
+    args.pretrained_model_dir = "/home/zjw/workspace/DL_Vision/TSR/YOLOX/YOLOX_outputs/train_tsr_2nd_128_211117/tsr_v3_20k_dense32_46_300pwttk_1e-3_0p001/best_ckpt.pth"
+    args.experiment_data_dir = '/home/zjw/workspace/DL_Vision/TSR/YOLOX/YOLOX_outputs/train_tsr_2nd_128_211125/tsr_v3_20k_dense16L1_46_i128_300pwttk_1e-3_0p001_model'
+    args.sparsity = 0.5
+    args.pruner = 'l1filter'
+    args.speed_up = True
+    args.dataset = ''
+    args.test_batch_size = 1
+    args.dependency_aware = True
     main(args)
